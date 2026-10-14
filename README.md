@@ -459,15 +459,40 @@
 
 <script>
 /* ============================================================
-   KONFIG
+   KONFIG — semua HTTPS, multi-endpoint auto-fallback
    ============================================================ */
 
-const CHAT_ENDPOINTS = {
-  nexadev: { url: 'https://api.nexadev.my.id/ai/chatgptpro', param: 'q', type: 'nexadev' },
-  qwen:    { url: 'http://api.ikyyxd.my.id/ai/qwen', param: 'prompt', type: 'qwen' },
-  gpt4:    { url: 'https://anabot.my.id/api/ai/gpt4', param: 'prompt', key: 'freeApikey', type: 'plain' }
-};
+/* Daftar endpoint chat — dicoba satu-satu sampai berhasil */
+const CHAT_ENDPOINTS_LIST = [
+  {
+    name: 'nexadev',
+    url: 'https://api.nexadev.my.id/ai/chatgptpro',
+    param: 'q',
+    type: 'nexadev'
+  },
+  {
+    name: 'qwen-https',
+    url: 'https://api.ikyyxd.my.id/ai/qwen',
+    param: 'prompt',
+    type: 'qwen'
+  },
+  {
+    name: 'gpt4',
+    url: 'https://anabot.my.id/api/ai/gpt4',
+    param: 'prompt',
+    key: 'freeApikey',
+    type: 'plain'
+  },
+  {
+    name: 'gpt4-alt',
+    url: 'https://api.anabot.my.id/api/ai/gpt4',
+    param: 'prompt',
+    key: 'freeApikey',
+    type: 'plain'
+  }
+];
 
+/* Image generator — HTTPS (Pollinations support HTTPS) */
 const IMG_API = 'https://image.pollinations.ai/prompt';
 
 /* ============ DETEKSI INTENT ============ */
@@ -593,7 +618,7 @@ const DEFAULTS = {
   size: '1024x1024',
   autoImg: true,
   nsfw: true,
-  endpoint: 'nexadev',
+  endpoint: 'auto',
   timeout: 60,
   autoScroll: true,
   fontSize: 15
@@ -911,7 +936,7 @@ function addImageMessage(imageUrl, promptText, labelText='Generated Image') {
   scrollBottom();
 }
 
-/* ============ CHAT API ============ */
+/* ============ CHAT API — MULTI ENDPOINT FALLBACK ============ */
 function parseChatResult(data, type) {
   if (!data) return '';
   if (type === 'nexadev') return data?.data?.message || '';
@@ -920,28 +945,49 @@ function parseChatResult(data, type) {
 }
 
 async function callChat(promptText) {
-  const ep = CHAT_ENDPOINTS[settings.endpoint] || CHAT_ENDPOINTS.nexadev;
   const timeoutMs = (settings.timeout || 60) * 1000;
+  let lastErr = null;
 
-  let url = `${ep.url}?${ep.param}=${encodeURIComponent(promptText)}`;
-  if (ep.key) url += `&apikey=${ep.key}`;
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, { method: 'GET', signal: ctrl.signal });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    const result = parseChatResult(data, ep.type);
-    if (!result || !String(result).trim()) throw new Error('Response kosong');
-    return String(result).trim();
-  } catch (e) {
-    clearTimeout(timer);
-    if (e.name === 'AbortError') throw new Error('Timeout ' + settings.timeout + 's');
-    throw e;
+  // Pilih endpoint berdasar setting
+  let list;
+  if (settings.endpoint === 'auto') {
+    list = CHAT_ENDPOINTS_LIST;
+  } else {
+    list = CHAT_ENDPOINTS_LIST.filter(e => e.name === settings.endpoint);
+    if (list.length === 0) list = CHAT_ENDPOINTS_LIST;
   }
+
+  // Coba satu-satu
+  for (const ep of list) {
+    try {
+      let url = `${ep.url}?${ep.param}=${encodeURIComponent(promptText)}`;
+      if (ep.key) url += `&apikey=${ep.key}`;
+
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
+      let res;
+      try {
+        res = await fetch(url, { method: 'GET', signal: ctrl.signal, mode: 'cors' });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const result = parseChatResult(data, ep.type);
+      if (result && String(result).trim()) {
+        return String(result).trim();
+      }
+      lastErr = new Error('Response kosong dari ' + ep.name);
+    } catch (e) {
+      lastErr = e;
+      // Lanjut ke endpoint berikutnya
+      continue;
+    }
+  }
+
+  throw lastErr || new Error('Semua endpoint gagal');
 }
 
 /* ============ SEND ============ */
@@ -963,6 +1009,7 @@ async function sendMessage(customText) {
   attachedImage = null;
   attachPreview.classList.remove('show');
 
+  // ============ EDIT FOTO (client-side filter) ============
   if (att && isEditRequest(text)) {
     addTyping();
     try {
@@ -999,6 +1046,7 @@ async function sendMessage(customText) {
     return;
   }
 
+  // ============ CHAT + IMAGE GEN ============
   addTyping();
   const wantsImage = isImageRequest(text) || (att && !isEditRequest(text));
 
@@ -1025,8 +1073,8 @@ async function sendMessage(customText) {
   } catch (err) {
     rmTyping();
     let msg = err.message || 'Gagal';
-    if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
-      msg = 'Koneksi gagal. Cek internet.';
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {
+      msg = 'Koneksi ke server gagal. Cek internet atau coba lagi.';
     }
     addMessage('Gagal: ' + msg, 'error');
   } finally {
